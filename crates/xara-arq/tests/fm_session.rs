@@ -64,3 +64,14 @@ fn compressed_frame_that_does_not_expand_is_nacked() {
     assert!(delivered(&out).is_empty(), "{out:?}");
     assert_eq!(ctrl_codes(&out), [NACK]);
 }
+
+#[test]
+fn compressed_frame_with_a_lost_frame_2_is_still_expanded() {
+    let (mut s, now) = text_receiver();
+    let e = compress(b"[WL2K-5.0-B2FWIHJM$]\r", 30, 1);
+    let mut d = start_frame(&e.bytes);
+    d.frames.push(fm::FrameIn { ok: false, bytes: Vec::new(), snr_db: 0.0 });
+    s.on_data(now, d);
+    let out = drain(&mut s);
+    assert_eq!(delivered(&out), &b"[WL2K-5.0-B2FWIHJM$]\r"[..e.consumed], "{out:?}");
+}

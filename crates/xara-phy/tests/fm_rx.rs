@@ -200,3 +200,44 @@ fn expected_double_with_lost_frame1() {
     assert_eq!(txs[0].frames.iter().map(|f| (f.missing, f.ok)).collect::<Vec<_>>(), [(true, false), (false, true)]);
     assert_eq!(txs[0].frames[1].bytes, f[1]);
 }
+
+#[test]
+fn hiss_after_a_single_frame_is_not_frame_2() {
+    let bw = FmBandwidth::Narrow;
+    let m = Modulator::new(bw);
+    let key = call_hash(b"N1CALL");
+    for (record, n) in [(15, 11), (14, 60), (1, 200)] {
+        for tail_ms in [100, 300, 1000] {
+            for level in [0.3, 1.0] {
+                let mut rng = Rng::new(5);
+                let mut s = Stream::new();
+                let start = s.x.len();
+                s.data(&m, record, key, vec![payload(&mut rng, record, bw, n, 1)], 25);
+                let end = s.x.len() - 9000;
+                s.gap(tail_ms * 48);
+                let rms = (s.x[start..end].iter().map(|v| v * v).sum::<f64>() / (end - start) as f64).sqrt();
+                let tones: Vec<(f64, f64)> = (6..60)
+                    .map(|k| (k as f64 * 50.0, rng.below(1000) as f64 / 1000.0 * std::f64::consts::TAU))
+                    .collect();
+                let g = level * rms / (tones.len() as f64 / 2.0).sqrt();
+                for (i, v) in s.x[end..end + tail_ms * 48].iter_mut().enumerate() {
+                    let t = i as f64 / 48000.0;
+                    *v = g * tones.iter().map(|&(f, ph)| (std::f64::consts::TAU * f * t + ph).sin()).sum::<f64>();
+                }
+                s.gap(48000);
+                let mut rx = Receiver::new(bw, key, &recs(&[1, 14, 15]), 1);
+                let mut txs = Vec::new();
+                for (i, b) in s.x.chunks(480).enumerate() {
+                    for e in rx.feed(b) {
+                        if let Event::Tx(t) = e {
+                            txs.push((t.frames.len(), t.complete, (i + 1) * 480 - end));
+                        }
+                    }
+                }
+                let what = format!("rec {record} tail {tail_ms} ms x{level}");
+                assert_eq!(txs.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>(), [(1, true)], "{what}");
+                assert!(txs[0].2 < 12000, "{what}: closed {} samples after frame 1", txs[0].2);
+            }
+        }
+    }
+}

@@ -364,3 +364,36 @@ fn receiver_abort_answers_the_next_frame_with_qrt() {
     let Tx::Ctrl { code: 3, .. } = sim.tx() else { panic!() };
     assert!(!sim.host.iter().any(|h| matches!(h, HostEvent::Data(_))));
 }
+
+#[test]
+fn compressed_frame_with_a_lost_frame_2_is_still_expanded() {
+    let mut cfg = Config::new(Bandwidth::Hz2300, "N0CALL");
+    (cfg.host.registered, cfg.host.compression) = (true, Compression::Text);
+    let mut sim = Sim { s: Session::new(cfg), now: 0, host: Vec::new(), txq: Vec::new() };
+    sim.s.connect(0, None, "N1CALL");
+    sim.tx();
+    sim.ctrl(18, 1);
+    sim.tx();
+    sim.ctrl(49, 2);
+    sim.tx();
+    assert_eq!(sim.s.state(), State::Receiving);
+    let lv = sim.s.level();
+    let len = Bandwidth::Hz2300.level(lv).frame_bytes() as usize;
+    let e = xara_arq::textcomp::compress(b"[WL2K-5.0-B2FWIHJM$]\r", len - 8, 1);
+    let ctrl = xara_phy::hf::frame::Control { reply: 2, compressed: true, hint: 6 };
+    let bytes = xara_phy::hf::frame::build_frame(len, &e.bytes, ctrl, None, term_marker(b"N0CALL"));
+    let lost = FrameIn { ok: false, bytes: Vec::new(), snr_db: 0.0 };
+    sim.now += SECOND;
+    sim.s.on_data(
+        sim.now,
+        DataIn { level: lv, frames: vec![FrameIn { ok: true, bytes, snr_db: 20.0 }, lost], t_end: sim.now },
+    );
+    sim.drain();
+    let rx: Vec<u8> = sim
+        .host
+        .iter()
+        .filter_map(|h| if let HostEvent::Data(d) = h { Some(d.clone()) } else { None })
+        .flatten()
+        .collect();
+    assert_eq!(rx, &b"[WL2K-5.0-B2FWIHJM$]\r"[..e.consumed]);
+}

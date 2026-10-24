@@ -998,7 +998,7 @@ impl Session {
         let two = d.frames.len() == 2;
         let parsed = self.parse_frames(&d);
         if let Some(Some(p)) = parsed.first() {
-            self.link.rx.turn_compressed.get_or_insert(!two && p.control.compressed);
+            self.link.rx.turn_compressed.get_or_insert(p.control.compressed);
         }
         let ok: Vec<bool> = parsed.iter().map(Option::is_some).collect();
         self.data_stored = true;
@@ -1043,12 +1043,13 @@ impl Session {
     }
 
     fn parse_frames(&mut self, d: &DataIn) -> Vec<Option<DataFrame>> {
-        let (two, vias) = (d.frames.len() == 2, !self.vias.is_empty());
+        let vias = !self.vias.is_empty();
         d.frames
             .iter()
-            .map(|f| {
+            .enumerate()
+            .map(|(i, f)| {
                 let mut p = f.ok.then(|| parse_data(d.record, &f.bytes, vias)).flatten()?;
-                p.data = self.link.inflate(two, p.control.compressed, std::mem::take(&mut p.data))?;
+                p.data = self.link.inflate(i == 1, p.control.compressed, std::mem::take(&mut p.data))?;
                 Some(p)
             })
             .collect()

@@ -176,3 +176,54 @@ fn control_frames() {
         }
     }
 }
+
+#[test]
+fn noise_after_a_single_frame_is_not_frame_2() {
+    let mut rng = Rng::new(11);
+    let mut fails = Vec::new();
+    for bw in Bandwidth::ALL {
+        let m = Modulator::new(bw);
+        for rec in bw.levels() {
+            for (burst_ms, clicks, late_ok) in [(30, 0, false), (100, 0, false), (0, 20, false), (1000, 0, true)] {
+                let frame = random_frame(&mut rng, bw.level(rec).frame_bytes() as usize);
+                let tx = normalise(&m.transmission(rec, &[&frame], &mut |n| rng.below(n)));
+                let mut x = vec![0.0; 24000];
+                x.extend(&tx);
+                let end = x.len();
+                x.extend(vec![0.0; 384000]);
+                let tones: Vec<(f64, f64)> = (6..60)
+                    .map(|k| (k as f64 * 50.0, rng.below(1000) as f64 / 1000.0 * std::f64::consts::TAU))
+                    .collect();
+                let g = 0.12 / (tones.len() as f64 / 2.0).sqrt();
+                let noise = |i: usize| {
+                    let t = i as f64 / 48000.0;
+                    g * tones.iter().map(|&(f, ph)| (std::f64::consts::TAU * f * t + ph).sin()).sum::<f64>()
+                };
+                for i in 0..burst_ms * 48 {
+                    x[end + i] += noise(i);
+                }
+                for k in 0..clicks {
+                    let at = end + k * 48000 / clicks;
+                    for i in 0..96 {
+                        x[at + i] += noise(i);
+                    }
+                }
+                let x: Vec<f64> = x.iter().map(|v| v + 0.002 * rng.gauss()).collect();
+                let mut rx = Receiver::new(bw, &[rec], 1, None);
+                let mut txs = Vec::new();
+                for (i, b) in x.chunks(480).enumerate() {
+                    for e in rx.feed(b) {
+                        if let Event::Tx(t) = e {
+                            txs.push((t.ok(), (i + 1) * 480 - end));
+                        }
+                    }
+                }
+                let ok = txs.len() == 1 && txs[0].0 == [true] && (late_ok || txs[0].1 < 24000);
+                if !ok {
+                    fails.push((bw, rec, burst_ms, clicks, txs));
+                }
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{fails:?}");
+}

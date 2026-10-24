@@ -73,8 +73,8 @@ impl Link {
         }
     }
 
-    pub(crate) fn inflate(&self, two: bool, compressed: bool, data: Vec<u8>) -> Option<Vec<u8>> {
-        if self.text() && !two && compressed { decompress(&data).map(|d| d.0) } else { Some(data) }
+    pub(crate) fn inflate(&self, second: bool, compressed: bool, data: Vec<u8>) -> Option<Vec<u8>> {
+        if self.text() && !second && compressed { decompress(&data).map(|d| d.0) } else { Some(data) }
     }
 
     pub(crate) fn turn_quit(&mut self, buf: &mut VecDeque<u8>) {

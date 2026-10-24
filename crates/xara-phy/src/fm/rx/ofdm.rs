@@ -182,8 +182,8 @@ impl OfdmEngine {
         out
     }
 
-    fn cells(&self, buf: &Track<Complex64>, t: i64) -> Vec<Vec<Complex64>> {
-        let seg = buf.get(t, t + self.span);
+    fn cells(&self, buf: &Track<Complex64>, t: i64, rows: usize) -> Vec<Vec<Complex64>> {
+        let seg = buf.get(t, t + rows as i64 * SYMLEN);
         let fb: Vec<usize> = self.l.bins().collect();
         seg.chunks(SYMLEN as usize)
             .enumerate()
@@ -201,13 +201,38 @@ impl OfdmEngine {
         (s.norm() / self.markers.len() as f64, s)
     }
 
+    pub fn early_coherence(&self, buf: &Track<Complex64>, t0: i64, rows: usize) -> Option<f64> {
+        let rows = rows.min(self.l.nsym());
+        if t0 + rows as i64 * SYMLEN + REFINE > buf.end() || t0 - REFINE < buf.base {
+            return None;
+        }
+        let qam = self.l.is_qam();
+        let cells: Vec<(usize, usize)> = (1..rows)
+            .flat_map(|r| (0..self.l.nc()).map(move |c| (r, c)))
+            .filter(|&(r, c)| !qam || self.map[c][r])
+            .collect();
+        (t0 - REFINE..=t0 + REFINE)
+            .map(|t| {
+                let c = self.cells(buf, t, rows);
+                let s: Complex64 = cells
+                    .iter()
+                    .map(|&(r, k)| {
+                        let d = c[r - 1][k].conj() * c[r][k];
+                        unit(if qam { d } else { d.powi(4) })
+                    })
+                    .sum();
+                s.norm() / cells.len().max(1) as f64
+            })
+            .max_by(f64::total_cmp)
+    }
+
     pub fn decode(&self, buf: &Track<Complex64>, codec: &Codec, t0: i64, index: usize) -> Option<FrameRx> {
         if t0 + self.span + REFINE > buf.end() || t0 - REFINE < buf.base {
             return None;
         }
         let cand: Vec<(Vec<Vec<Complex64>>, f64, Complex64)> = (t0 - REFINE..=t0 + REFINE)
             .map(|t| {
-                let c = self.cells(buf, t);
+                let c = self.cells(buf, t, self.l.nsym());
                 let (m, s) = self.coherence(&c);
                 (c, m, s)
             })

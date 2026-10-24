@@ -16,6 +16,7 @@ const BUF_SECONDS: f64 = 12.0;
 const GRACE: i64 = 2 * SYMLEN;
 const CONTINUE_AT: i64 = 2 * SYMLEN;
 const NOISE_BLOCK: usize = 60;
+const PROBE_ROWS: usize = 6;
 
 #[derive(Clone, Debug)]
 pub struct CtrlEvent {
@@ -74,6 +75,7 @@ pub struct Receiver {
     muted: Muted,
     ctrl: [Option<CtrlDetector>; 2],
     codec: Codec,
+    probed: Option<i64>,
     pub stats: Stats,
 }
 
@@ -90,6 +92,7 @@ impl Receiver {
             muted: Muted::default(),
             ctrl: [None, None],
             codec: Codec::new(bw),
+            probed: None,
             stats: Stats::default(),
         };
         rx.expect(records, Some(nframes));
@@ -227,13 +230,24 @@ impl Receiver {
             cur.two = true;
         }
         let (t2, record) = (cur.t + span, cur.record);
+        let guessed = self.asm.nframes != 2;
+        if guessed && self.probed != Some(t2) {
+            match self.engines[&record].early_coherence(&self.buf, t2, PROBE_ROWS) {
+                None => {
+                    self.asm.cur = Some(cur);
+                    return Vec::new();
+                }
+                Some(c) if c < MIN_COHERENCE => return self.finish(cur),
+                Some(_) => self.probed = Some(t2),
+            }
+        }
         self.asm.cur = Some(cur);
         if self.buf.end() < t2 + span + GRACE {
             return Vec::new();
         }
         match self.decode(record, t2, 1, ()) {
-            Some(r) => self.close(r, false, Vec::new()),
-            None => self.finalize(),
+            Some(r) if !guessed || r.ok || r.coherence >= MIN_COHERENCE => self.close(r, false, Vec::new()),
+            _ => self.finalize(),
         }
     }
 }
@@ -306,8 +320,8 @@ impl Assemble for Receiver {
 
     fn wait(&self, _: Record, _: &FrameRx, _: ()) {}
 
-    fn expected_frames(&self, cur: &Pending<FrameRx, ()>) -> usize {
-        if cur.two { 2 } else { self.asm.nframes.max(1) }
+    fn expected_frames(&self, _: &Pending<FrameRx, ()>) -> usize {
+        self.asm.nframes.max(1)
     }
 
     fn finished(&mut self, _: &[FrameRx]) {

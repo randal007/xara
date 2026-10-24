@@ -23,6 +23,7 @@ const GRACE: i64 = (0.04 * FS3) as i64;
 const CONFIRM_GAP: i64 = 8;
 const CONFIRM_GAP_PSK: i64 = 48;
 const CONFIRM_LEN: i64 = 60;
+const CONFIRM_WINDOWS: i64 = 10;
 const FRAME2_LOOKAHEAD: i64 = 3 * 32 + 16;
 
 pub(crate) struct Ctx<'a> {
@@ -363,13 +364,17 @@ impl Receiver {
         let Some(mut cur) = self.asm.cur.take() else { return Vec::new() };
         let Some(e) = self.engines.get(&cur.record) else { return self.finish(cur) };
         let (span, tail) = (e.span(), e.tail());
-        if let Some(c) = cur.wait.confirm {
-            if self.buf.end() < c.1 {
+        if let Some((mut a, b)) = cur.wait.confirm {
+            while a < b && a + CONFIRM_LEN <= self.buf.end() {
+                if !self.continues(&cur, (a, a + CONFIRM_LEN)) {
+                    return self.finish(cur);
+                }
+                a += CONFIRM_LEN;
+            }
+            if a < b {
+                cur.wait.confirm = Some((a, b));
                 self.asm.cur = Some(cur);
                 return Vec::new();
-            }
-            if !self.continues(&cur, c) {
-                return self.finish(cur);
             }
             cur.wait.confirm = None;
             cur.two = true;
@@ -380,11 +385,11 @@ impl Receiver {
             let t2 = cur.t + span;
             if self.buf.end() >= t2 + span + tail + FRAME2_LOOKAHEAD {
                 return match self.decode(cur.record, t2, 1, cur.wait.hyp) {
-                    Some(r) => {
+                    Some(r) if r.frame.ok || self.asm.nframes == 2 => {
                         self.asm.cur = Some(cur);
                         self.close(r, true, Vec::new())
                     }
-                    None => self.finish(cur),
+                    _ => self.finish(cur),
                 };
             }
         }
@@ -468,7 +473,7 @@ impl Assemble for Receiver {
         let deadline = t + body + tail + GRACE + if r.frame.ok { 0 } else { self.max_extra(record) };
         let confirm = (r.frame.ok && nframes == 1 && self.confirm_end).then(|| {
             let g = if psk { CONFIRM_GAP_PSK } else { CONFIRM_GAP };
-            (r.frame.t_end + g, r.frame.t_end + g + CONFIRM_LEN)
+            (r.frame.t_end + g, r.frame.t_end + g + CONFIRM_WINDOWS * CONFIRM_LEN)
         });
         Wait { t1_end: t + span, hyp: k, deadline, confirm }
     }

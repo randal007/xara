@@ -1267,7 +1267,7 @@ impl Session {
         let two = d.frames.len() == 2;
         let good = self.parse_frames(&d.frames);
         if let Some(Some(g)) = good.first() {
-            self.link.rx.turn_compressed.get_or_insert(!two && g.meta.ctrl.compressed);
+            self.link.rx.turn_compressed.get_or_insert(g.meta.ctrl.compressed);
         }
         let ok: Vec<bool> = good.iter().map(Option::is_some).collect();
         let s = self.rx_stats(&d.frames, &ok, l);
@@ -1304,13 +1304,13 @@ impl Session {
     }
 
     fn parse_frames(&mut self, frames: &[FrameIn]) -> Vec<Option<Good>> {
-        let two = frames.len() == 2;
         frames
             .iter()
-            .map(|f| {
+            .enumerate()
+            .map(|(i, f)| {
                 let p = f.ok.then(|| parse(&f.bytes, self.carry.marker)).flatten()?;
                 let meta = FrameMeta { ctrl: p.ctrl, last: p.last, full: p.full, next_level: p.next_level };
-                let data = self.link.inflate(two, meta.ctrl.compressed, p.data?)?;
+                let data = self.link.inflate(i == 1, meta.ctrl.compressed, p.data?)?;
                 Some(Good { meta, data })
             })
             .collect()
