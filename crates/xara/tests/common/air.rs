@@ -107,14 +107,22 @@ impl<M: Modem, const N: usize> Air<M, N> {
     }
 
     pub fn run_until(&mut self, secs: f64, mut done: impl FnMut(&Self) -> bool) -> bool {
-        let limit = self.secs() + secs;
+        let (t0, w0) = (self.secs(), std::time::Instant::now());
+        let limit = t0 + secs;
+        let mut ok = false;
         while self.secs() < limit {
             if done(self) {
-                return true;
+                ok = true;
+                break;
             }
             self.step();
         }
-        done(self)
+        let ok = ok || done(self);
+        if std::env::var_os("XARA_BENCH").is_some() {
+            let (air, wall) = (self.secs() - t0, w0.elapsed().as_secs_f64());
+            eprintln!("bench: {air:.1} s on air in {wall:.2} s ({:.1}x real time, both stations)", air / wall);
+        }
+        ok
     }
 
     pub fn has(&self, i: usize, r: &Report) -> bool {
