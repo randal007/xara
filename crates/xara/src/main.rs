@@ -671,6 +671,7 @@ fn real_main() -> Result<ExitCode, String> {
         xara::ptt::wait_released(SECOND_SIGNAL_GRACE);
     })
     .map_err(|e| format!("signals: {e}"))?;
+    signals::trap_busy_bypass().map_err(|e| format!("signals: {e}"))?;
     let (mut a, io) = open_audio(&argv, a, applied.then_some(&saved), &mut error).map_err(|e| e.to_string())?;
     if let Some(d) = &dir {
         say!("settings in {}", d.join(settings::FILE).display());

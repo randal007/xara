@@ -7,6 +7,39 @@ use std::thread;
 
 static PIPE: AtomicI32 = AtomicI32::new(-1);
 
+/// Busy detector bypass (X6100 XARA): SIGUSR1 ignores the busy detector for
+/// unproto/KISS transmissions, SIGUSR2 uses it again. On a noisy band the
+/// detector can hold every broadcast; the operator decides.
+pub static IGNORE_BUSY: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn ignore_busy_on(_: libc::c_int) {
+    IGNORE_BUSY.store(true, Ordering::Relaxed);
+}
+
+extern "C" fn ignore_busy_off(_: libc::c_int) {
+    IGNORE_BUSY.store(false, Ordering::Relaxed);
+}
+
+/// SIGUSR1 / SIGUSR2 turn the busy bypass on / off (atomic store only).
+pub fn trap_busy_bypass() -> io::Result<()> {
+    for (s, f) in [
+        (libc::SIGUSR1, ignore_busy_on as extern "C" fn(libc::c_int)),
+        (libc::SIGUSR2, ignore_busy_off as extern "C" fn(libc::c_int)),
+    ] {
+        // SAFETY: an all-zero sigaction is valid, and the handlers only store to an atomic.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = f as libc::sighandler_t;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            if libc::sigaction(s, &sa, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
 extern "C" fn deliver(_: libc::c_int) {
     // SAFETY: errno is thread-local and restored before returning; write is async-signal-safe.
     unsafe {

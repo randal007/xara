@@ -133,7 +133,8 @@ impl Station {
         let ctx = broadcast::Ctx {
             idle: self.idle() && !self.c.tx.ptt() && !self.c.tx.tuning(),
             bw500: self.c.cfg.bw == Bandwidth::Hz500,
-            busy: self.un.busy || self.c.busy.is_on(),
+            busy: self.un.busy
+                || (self.c.busy.is_on() && !crate::signals::IGNORE_BUSY.load(std::sync::atomic::Ordering::Relaxed)),
             reply: self.un.reply_fmt,
             marker: self.un.marker,
             queued: self.buffered(),
