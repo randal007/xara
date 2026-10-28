@@ -2,7 +2,10 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::pulse_ffi::{BufferAttr, Conn, Peek, S16LE, STREAM_ADJUST_LATENCY, STREAM_DONT_MOVE, SampleSpec, Stream};
+use super::pulse_ffi::{
+    BufferAttr, Conn, Peek, S16LE, STREAM_ADJUST_LATENCY, STREAM_AUTO_TIMING_UPDATE, STREAM_DONT_MOVE,
+    STREAM_INTERPOLATE_TIMING, SampleSpec, Stream,
+};
 use super::{Audio, BLOCK, DeviceList, RATE, STALL, capture_only};
 
 const SETUP: Duration = Duration::from_secs(5);
@@ -110,6 +113,9 @@ pub struct PulseIo {
     seen: [u64; 3],
     base: [u64; 3],
     reads: u32,
+    /// Silence blocks not written because playback was full (see write).
+    skipped: u64,
+    last_latency_log: Instant,
 }
 
 impl PulseIo {
@@ -129,7 +135,7 @@ impl PulseIo {
         if let Some((name, radio)) = playback {
             check_playback(&sinks(&conn)?, name, radio)?;
         }
-        let flags = STREAM_DONT_MOVE | STREAM_ADJUST_LATENCY;
+        let flags = STREAM_DONT_MOVE | STREAM_ADJUST_LATENCY | STREAM_INTERPOLATE_TIMING | STREAM_AUTO_TIMING_UPDATE;
         let attr = |fragsize, tlength| BufferAttr {
             maxlength: u32::MAX,
             tlength,
@@ -168,6 +174,8 @@ impl PulseIo {
             seen: [0; 3],
             base: [0; 3],
             reads: 0,
+            skipped: 0,
+            last_latency_log: Instant::now(),
         })
     }
 
@@ -187,6 +195,18 @@ impl PulseIo {
                 say!("audio dropouts: counting from here");
             }
             return;
+        }
+        // Every 10 s: the real delays, so a backlog shows (X6100 XARA).
+        if self.last_latency_log.elapsed() >= Duration::from_secs(10) {
+            self.last_latency_log = Instant::now();
+            let f = |v: Option<f64>| v.map_or("?".to_string(), |ms| format!("{ms:.0} ms"));
+            let pending = self.rx.len() / 2 * 1000 / RATE as usize;
+            say!(
+                "audio latency: capture {} (+{pending} ms unread), playback {}, silence skipped {}",
+                f(self.rec.latency_ms()),
+                f(self.play.as_ref().and_then(Stream::latency_ms)),
+                self.skipped
+            );
         }
         for (i, (c, what)) in [
             (&PLAY_UNDERFLOWS, "playback underflow"),
@@ -242,6 +262,15 @@ impl Audio for PulseIo {
             play.live("playback")?;
             let n = play.writable_size().min(self.tx.len() - off) & !1;
             if n == 0 {
+                // X6100 XARA: a block of pure silence while playback is full
+                // is dropped rather than waited for. Waiting here held the
+                // loop to real time, so received audio that piled up during
+                // any stall was never caught up: the receive delay grew to
+                // ~1 s and replies came "too late" for the ARQ timing.
+                if off == 0 && x.iter().all(|&v| v == 0) {
+                    self.skipped += 1;
+                    return Ok(());
+                }
                 self.conn.iterate(until, "playback (sink not draining)")?;
                 continue;
             }

@@ -23,6 +23,8 @@ type ListFn<T> = unsafe extern "C" fn(*mut Raw, ListCb<T>, *mut c_void) -> *mut 
 pub const S16LE: c_int = 3;
 pub const STREAM_DONT_MOVE: c_int = 0x0200;
 pub const STREAM_ADJUST_LATENCY: c_int = 0x2000;
+pub const STREAM_INTERPOLATE_TIMING: c_int = 0x0002;
+pub const STREAM_AUTO_TIMING_UPDATE: c_int = 0x0008;
 const CONTEXT_NOAUTOSPAWN: c_int = 1;
 const CONTEXT_READY: c_int = 4;
 const CONTEXT_FAILED: c_int = 5;
@@ -131,6 +133,7 @@ unsafe extern "C" {
         seek: c_int,
     ) -> c_int;
     fn pa_stream_disconnect(s: *mut Raw) -> c_int;
+    fn pa_stream_get_latency(s: *mut Raw, usec: *mut u64, negative: *mut c_int) -> c_int;
     fn pa_stream_set_underflow_callback(s: *mut Raw, cb: Option<NotifyCb>, userdata: *mut c_void);
     fn pa_stream_set_overflow_callback(s: *mut Raw, cb: Option<NotifyCb>, userdata: *mut c_void);
     fn pa_stream_unref(s: *mut Raw);
@@ -408,6 +411,15 @@ impl Stream {
     pub fn count_overflows(&mut self, c: &'static std::sync::atomic::AtomicU64) {
         // SAFETY: the stream is live; c is static, so the pointer stays valid.
         unsafe { pa_stream_set_overflow_callback(self.raw(), Some(count_notice), c as *const _ as *mut c_void) }
+    }
+
+    /// The stream's latency as PulseAudio sees it (needs the timing flags),
+    /// or None before its first timing update.
+    pub fn latency_ms(&self) -> Option<f64> {
+        let (mut us, mut neg) = (0u64, 0 as c_int);
+        // SAFETY: the stream is live and both out pointers are valid.
+        let r = unsafe { pa_stream_get_latency(self.raw(), &mut us, &mut neg) };
+        (r == 0).then(|| if neg != 0 { -(us as f64) / 1000.0 } else { us as f64 / 1000.0 })
     }
 
     pub fn writable_size(&self) -> usize {
