@@ -68,6 +68,7 @@ pub struct Station {
     cb: Option<Codebook>,
     tx_rnd: VbRnd,
     un: Unproto,
+    gate_seen: bool,
 }
 
 impl Station {
@@ -84,6 +85,7 @@ impl Station {
             entries: Vec::new(),
             cb: None,
             tx_rnd: VbRnd::new(),
+            gate_seen: crate::signals::may_answer(),
         };
         s.drain();
         s
@@ -374,7 +376,8 @@ impl Modem for Station {
             self.cb = Some(cb);
             self.keys = Some(l.keys.clone());
         }
-        let answering = self.c.listen_on || self.c.session.state() != State::Listen;
+        self.gate_seen = crate::signals::may_answer();
+        let answering = (self.c.listen_on && self.gate_seen) || self.c.session.state() != State::Listen;
         let entries: Vec<CtrlEntry> =
             self.entries.iter().filter(|e| answering && l.codes.contains(&e.code)).cloned().collect();
         self.rx.set_ctrl_entries((!entries.is_empty()).then_some(&entries[..]));
@@ -455,6 +458,11 @@ impl Modem for Station {
 
     fn process(&mut self, input: &[f64], output: &mut [f64]) {
         let (t0, n) = (self.c.now, input.len());
+        if crate::signals::may_answer() != self.gate_seen
+            && let Some(l) = self.c.listen.clone()
+        {
+            self.apply(l);
+        }
         let fed = self.key_block(t0, input, output);
         self.c.now = t0 + n as Time;
         self.c.busy.set_bw(self.c.session.bandwidth());

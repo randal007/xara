@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::thread;
 
 static PIPE: AtomicI32 = AtomicI32::new(-1);
@@ -27,6 +27,48 @@ pub fn trap_busy_bypass() -> io::Result<()> {
         (libc::SIGUSR2, ignore_busy_off as extern "C" fn(libc::c_int)),
     ] {
         // SAFETY: an all-zero sigaction is valid, and the handlers only store to an atomic.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = f as libc::sighandler_t;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            if libc::sigaction(s, &sa, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Answer gate (X6100 XARA): with `--answer-gate` xara answers no incoming
+/// call until the operator allows it, whatever the host's LISTEN says.
+/// SIGRTMIN allows answering, SIGRTMIN+1 blocks it again. Without the flag
+/// nothing changes.
+pub const GATE_NONE: u8 = 0;
+pub const GATE_CLOSED: u8 = 1;
+pub const GATE_OPEN: u8 = 2;
+pub static ANSWER_GATE: AtomicU8 = AtomicU8::new(GATE_NONE);
+
+/// True unless `--answer-gate` is on and answering isn't allowed.
+pub fn may_answer() -> bool {
+    ANSWER_GATE.load(Ordering::Relaxed) != GATE_CLOSED
+}
+
+extern "C" fn answer_open(_: libc::c_int) {
+    let _ = ANSWER_GATE.compare_exchange(GATE_CLOSED, GATE_OPEN, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+extern "C" fn answer_close(_: libc::c_int) {
+    let _ = ANSWER_GATE.compare_exchange(GATE_OPEN, GATE_CLOSED, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// SIGRTMIN / SIGRTMIN+1 open / close the answer gate (atomic only).
+pub fn trap_answer_gate() -> io::Result<()> {
+    for (s, f) in [
+        (libc::SIGRTMIN(), answer_open as extern "C" fn(libc::c_int)),
+        (libc::SIGRTMIN() + 1, answer_close as extern "C" fn(libc::c_int)),
+    ] {
+        // SAFETY: an all-zero sigaction is valid, and the handlers only touch an atomic.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = f as libc::sighandler_t;

@@ -68,6 +68,7 @@ alternatively for a local setup you can do:
 
     --digi CALL             FM digipeat for CALL (default: off)
     --record PATH           record rx, tx and PTT to FLAC (or WAV if .wav)
+    --answer-gate           answer no calls until SIGRTMIN (SIGRTMIN+1: stop again)
     --quiet                 no output
     --version and --help    guess
 

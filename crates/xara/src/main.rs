@@ -147,6 +147,7 @@ fn take(a: &mut Args, k: &str, mut v: impl FnMut() -> Result<String, String>) ->
         "--ptt-tail-ms" => a.timing.tail = Duration::from_millis(num(k, &v()?)?),
         "--ptt-max-s" => a.timing.max_on = Duration::from_secs(num(k, &v()?)?),
         "--record" => a.record = Some(PathBuf::from(v()?)),
+        "--answer-gate" => signals::ANSWER_GATE.store(signals::GATE_CLOSED, std::sync::atomic::Ordering::Relaxed),
         #[cfg(feature = "registered")]
         "--registered" => a.registered = true,
         #[cfg(not(feature = "registered"))]
@@ -672,6 +673,7 @@ fn real_main() -> Result<ExitCode, String> {
     })
     .map_err(|e| format!("signals: {e}"))?;
     signals::trap_busy_bypass().map_err(|e| format!("signals: {e}"))?;
+    signals::trap_answer_gate().map_err(|e| format!("signals: {e}"))?;
     let (mut a, io) = open_audio(&argv, a, applied.then_some(&saved), &mut error).map_err(|e| e.to_string())?;
     if let Some(d) = &dir {
         say!("settings in {}", d.join(settings::FILE).display());
