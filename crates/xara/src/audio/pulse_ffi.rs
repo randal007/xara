@@ -124,6 +124,7 @@ unsafe extern "C" {
     fn pa_stream_peek(s: *mut Raw, data: *mut *const c_void, nbytes: *mut usize) -> c_int;
     fn pa_stream_drop(s: *mut Raw) -> c_int;
     fn pa_stream_writable_size(s: *mut Raw) -> usize;
+    fn pa_stream_readable_size(s: *mut Raw) -> usize;
     fn pa_stream_write(
         s: *mut Raw,
         data: *const c_void,
@@ -420,6 +421,15 @@ impl Stream {
         // SAFETY: the stream is live and both out pointers are valid.
         let r = unsafe { pa_stream_get_latency(self.raw(), &mut us, &mut neg) };
         (r == 0).then(|| if neg != 0 { -(us as f64) / 1000.0 } else { us as f64 / 1000.0 })
+    }
+
+    /// Bytes of received audio waiting in the stream (0 on error).
+    pub fn readable_size(&self) -> usize {
+        // SAFETY: the stream is live.
+        match unsafe { pa_stream_readable_size(self.raw()) } {
+            usize::MAX => 0,
+            n => n,
+        }
     }
 
     pub fn writable_size(&self) -> usize {

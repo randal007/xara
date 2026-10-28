@@ -116,6 +116,8 @@ pub struct PulseIo {
     /// Silence blocks not written because playback was full (see write).
     skipped: u64,
     last_latency_log: Instant,
+    catching_up: bool,
+    cap_ms: u32,
 }
 
 impl PulseIo {
@@ -143,14 +145,27 @@ impl PulseIo {
             minreq: u32::MAX,
             fragsize,
         };
+        // Buffer sizes (X6100 XARA): XARA_CAPTURE_MS / XARA_PLAYBACK_MS, else
+        // 10 / 20 ms. The radio's 10/20 ms ran dry ~6 times a second.
+        let ms = |var: &str, default: u32| {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&v| (1..=1000).contains(&v))
+                .unwrap_or(default)
+        };
+        let (cap_ms, play_ms) = (ms("XARA_CAPTURE_MS", 10), ms("XARA_PLAYBACK_MS", 20));
+        if (cap_ms, play_ms) != (10, 20) {
+            say!("audio buffers: capture {cap_ms} ms, playback {play_ms} ms");
+        }
         let mut rec = Stream::new(&conn, c"rx", &SPEC).ok_or_else(|| io::Error::other("pulse stream"))?;
         rec.count_overflows(&REC_OVERFLOWS);
-        rec.connect_record(capture, &attr(bytes(10), u32::MAX), flags)?;
+        rec.connect_record(capture, &attr(bytes(cap_ms), u32::MAX), flags)?;
         let play = match playback {
             Some((name, _)) => {
                 let mut p = Stream::new(&conn, c"tx", &SPEC).ok_or_else(|| io::Error::other("pulse stream"))?;
                 p.count_underflows(&PLAY_UNDERFLOWS);
-                p.connect_playback(name, &attr(u32::MAX, bytes(20)), flags)?;
+                p.connect_playback(name, &attr(u32::MAX, bytes(play_ms)), flags)?;
                 Some((p, name))
             }
             None => None,
@@ -176,6 +191,8 @@ impl PulseIo {
             reads: 0,
             skipped: 0,
             last_latency_log: Instant::now(),
+            catching_up: false,
+            cap_ms,
         })
     }
 
@@ -267,7 +284,19 @@ impl Audio for PulseIo {
                 // loop to real time, so received audio that piled up during
                 // any stall was never caught up: the receive delay grew to
                 // ~1 s and replies came "too late" for the ARQ timing.
-                if off == 0 && x.iter().all(|&v| v == 0) {
+                // Only when received audio has really piled up (over 100 ms
+                // waiting), so normal running never skips: capture arrives in
+                // chunks of its buffer size, and skipping on every full
+                // playback ran it dry once per chunk (build 12).
+                // Start above 100 ms waiting, then keep on until it is down
+                // to one capture chunk (else ~100 ms of delay stays for good).
+                let backlog_ms = (self.rec.readable_size() + self.rx.len()) / 2 * 1000 / RATE as usize;
+                if backlog_ms > 100 {
+                    self.catching_up = true;
+                } else if backlog_ms <= self.cap_ms as usize + 10 {
+                    self.catching_up = false;
+                }
+                if off == 0 && self.catching_up && x.iter().all(|&v| v == 0) {
                     self.skipped += 1;
                     return Ok(());
                 }
