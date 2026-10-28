@@ -9,6 +9,15 @@ use super::remaining;
 
 type Raw = c_void;
 type ListCb<T> = extern "C" fn(*mut Raw, *const T, c_int, *mut c_void);
+type NotifyCb = extern "C" fn(*mut Raw, *mut c_void);
+
+/// Underflow / overflow notices (X6100 XARA): the callback only adds one to
+/// the counter it was given.
+extern "C" fn count_notice(_: *mut Raw, userdata: *mut c_void) {
+    // SAFETY: userdata is always a &'static AtomicU64 (see Stream::count_*).
+    let c = unsafe { &*(userdata as *const std::sync::atomic::AtomicU64) };
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 type ListFn<T> = unsafe extern "C" fn(*mut Raw, ListCb<T>, *mut c_void) -> *mut Raw;
 
 pub const S16LE: c_int = 3;
@@ -122,6 +131,8 @@ unsafe extern "C" {
         seek: c_int,
     ) -> c_int;
     fn pa_stream_disconnect(s: *mut Raw) -> c_int;
+    fn pa_stream_set_underflow_callback(s: *mut Raw, cb: Option<NotifyCb>, userdata: *mut c_void);
+    fn pa_stream_set_overflow_callback(s: *mut Raw, cb: Option<NotifyCb>, userdata: *mut c_void);
     fn pa_stream_unref(s: *mut Raw);
     fn pa_strerror(error: c_int) -> *const c_char;
 }
@@ -385,6 +396,18 @@ impl Stream {
     pub fn discard(&mut self, what: &str) -> io::Result<()> {
         // SAFETY: the stream is live and no Peek borrow is outstanding.
         status(what, unsafe { pa_stream_drop(self.raw()) })
+    }
+
+    /// Counts this playback stream's underflows (it ran dry) in `c`.
+    pub fn count_underflows(&mut self, c: &'static std::sync::atomic::AtomicU64) {
+        // SAFETY: the stream is live; c is static, so the pointer stays valid.
+        unsafe { pa_stream_set_underflow_callback(self.raw(), Some(count_notice), c as *const _ as *mut c_void) }
+    }
+
+    /// Counts this record stream's overflows (audio lost before it was read) in `c`.
+    pub fn count_overflows(&mut self, c: &'static std::sync::atomic::AtomicU64) {
+        // SAFETY: the stream is live; c is static, so the pointer stays valid.
+        unsafe { pa_stream_set_overflow_callback(self.raw(), Some(count_notice), c as *const _ as *mut c_void) }
     }
 
     pub fn writable_size(&self) -> usize {

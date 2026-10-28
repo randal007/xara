@@ -1,10 +1,19 @@
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::pulse_ffi::{BufferAttr, Conn, Peek, S16LE, STREAM_ADJUST_LATENCY, STREAM_DONT_MOVE, SampleSpec, Stream};
-use super::{Audio, DeviceList, RATE, STALL, capture_only};
+use super::{Audio, BLOCK, DeviceList, RATE, STALL, capture_only};
 
 const SETUP: Duration = Duration::from_secs(5);
+
+/// Dropouts (X6100 XARA): PulseAudio's underflow notices on the playback
+/// stream, overflow notices on the record stream, and holes (audio lost
+/// before it was read, filled with silence below). Logged as they happen,
+/// so a gap on the air can be told from a glitch elsewhere.
+static PLAY_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
+static REC_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static REC_HOLES: AtomicU64 = AtomicU64::new(0);
 const SPEC: SampleSpec = SampleSpec { format: S16LE, rate: RATE, channels: 1 };
 
 fn connect() -> io::Result<Conn> {
@@ -98,6 +107,9 @@ pub struct PulseIo {
     conn: Conn,
     rx: Vec<u8>,
     tx: Vec<u8>,
+    seen: [u64; 3],
+    base: [u64; 3],
+    reads: u32,
 }
 
 impl PulseIo {
@@ -126,10 +138,12 @@ impl PulseIo {
             fragsize,
         };
         let mut rec = Stream::new(&conn, c"rx", &SPEC).ok_or_else(|| io::Error::other("pulse stream"))?;
+        rec.count_overflows(&REC_OVERFLOWS);
         rec.connect_record(capture, &attr(bytes(10), u32::MAX), flags)?;
         let play = match playback {
             Some((name, _)) => {
                 let mut p = Stream::new(&conn, c"tx", &SPEC).ok_or_else(|| io::Error::other("pulse stream"))?;
+                p.count_underflows(&PLAY_UNDERFLOWS);
                 p.connect_playback(name, &attr(u32::MAX, bytes(20)), flags)?;
                 Some((p, name))
             }
@@ -145,7 +159,49 @@ impl PulseIo {
                 return Err(io::Error::other(format!("{want}: the sound server attached {got:?} instead")));
             }
         }
-        Ok(Self { rec, play: play.map(|(p, _)| p), conn, rx: Vec::new(), tx: Vec::new() })
+        Ok(Self {
+            rec,
+            play: play.map(|(p, _)| p),
+            conn,
+            rx: Vec::new(),
+            tx: Vec::new(),
+            seen: [0; 3],
+            base: [0; 3],
+            reads: 0,
+        })
+    }
+
+    /// One line per new dropout (they should be rare; a burst of them is
+    /// summarised), e.g. "audio dropout: playback underflow (3 so far)".
+    fn report(&mut self) {
+        /* The first half second doesn't count: playback starts with an
+         * underflow before the first audio arrives. */
+        const SETTLE_READS: u32 = RATE / BLOCK as u32 / 2;
+        if self.reads < SETTLE_READS {
+            self.reads += 1;
+            if self.reads == SETTLE_READS {
+                for (i, c) in [&PLAY_UNDERFLOWS, &REC_OVERFLOWS, &REC_HOLES].into_iter().enumerate() {
+                    self.seen[i] = c.load(Ordering::Relaxed);
+                    self.base[i] = self.seen[i];
+                }
+                say!("audio dropouts: counting from here");
+            }
+            return;
+        }
+        for (i, (c, what)) in [
+            (&PLAY_UNDERFLOWS, "playback underflow"),
+            (&REC_OVERFLOWS, "capture overflow"),
+            (&REC_HOLES, "capture hole"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let n = c.load(Ordering::Relaxed);
+            if n != self.seen[i] {
+                say!("audio dropout: {what} ({} since start)", n - self.base[i]);
+                self.seen[i] = n;
+            }
+        }
     }
 }
 
@@ -160,7 +216,10 @@ impl Audio for PulseIo {
                     self.conn.iterate(until, "capture (no audio)")?;
                     continue;
                 }
-                Peek::Hole(n) => self.rx.resize(self.rx.len() + n, 0),
+                Peek::Hole(n) => {
+                    REC_HOLES.fetch_add(1, Ordering::Relaxed);
+                    self.rx.resize(self.rx.len() + n, 0)
+                }
                 Peek::Data(d) => self.rx.extend_from_slice(d),
             }
             self.rec.discard("capture")?;
@@ -169,6 +228,7 @@ impl Audio for PulseIo {
             *v = i16::from_le_bytes([c[0], c[1]]);
         }
         self.rx.drain(..need);
+        self.report();
         Ok(())
     }
 
