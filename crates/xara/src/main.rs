@@ -285,6 +285,38 @@ fn lead_samples(a: &Args) -> usize {
     a.timing.lead.as_millis() as usize * (audio::RATE / 1000) as usize
 }
 
+/// X6100 XARA: the playback buffer set with XARA_PLAYBACK_MS delays every
+/// transmission by that much on the air, so it counts as TX latency like the
+/// PTT lead: xara then writes and keys that much earlier, stays keyed until
+/// it has played out, and starts its reply windows at the real end. Without
+/// it a call ended ~80 ms later than xara thought and VARA's replies (heard,
+/// 15/15) landed just after xara's window (P2P test 2026-10-29). Unset: 0,
+/// as upstream.
+fn playback_buffer_samples() -> usize {
+    std::env::var("XARA_PLAYBACK_MS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| (1..=1000).contains(&v))
+        .map_or(0, |ms| ms * (audio::RATE / 1000) as usize)
+}
+
+/// X6100 XARA: XARA_NICE (-20..19) sets xara's CPU priority before any
+/// thread starts, so every thread has it; on the radio the GUI shares the
+/// CPU and xara's audio must be refilled on time.
+fn apply_nice() {
+    if let Some(n) =
+        std::env::var("XARA_NICE").ok().and_then(|v| v.parse::<i32>().ok()).filter(|n| (-20..=19).contains(n))
+    {
+        // SAFETY: setpriority only reads its arguments.
+        let r = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, n) };
+        if r == 0 {
+            say!("priority: nice {n}");
+        } else {
+            say!("priority: nice {n} refused: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
 fn state_dir(a: &Args) -> Option<PathBuf> {
     let env = std::env::var("STATE_DIRECTORY").ok();
     let dir = a.state_dir.clone().or_else(|| env.and_then(|e| e.split(':').next().map(String::from)))?;
@@ -408,7 +440,7 @@ fn run(
     stop: &Arc<AtomicBool>,
     rec: Option<&mut Recorder>,
 ) -> std::io::Result<Outcome> {
-    let opts = Options { drive_db: a.drive_db, tx_latency: lead_samples(a) as i64 };
+    let opts = Options { drive_db: a.drive_db, tx_latency: (lead_samples(a) + playback_buffer_samples()) as i64 };
     let host = Host::bind(&a.addr, a.port)?;
     let mode = match a.fm {
         Some(bw) => format!("FM {bw:?}"),
@@ -611,6 +643,7 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<ExitCode, String> {
+    apply_nice();
     let inherited = std::env::var(TOKEN_ENV).ok().filter(|t| valid_token(t));
     let part: u32 = std::env::var(RECORD_PART_ENV).ok().and_then(|p| p.parse().ok()).unwrap_or(0);
     unsafe {
