@@ -136,21 +136,45 @@ pub fn modulate(
     let lead: Vec<Vec<Complex64>> =
         (0..l.lead_in()).map(|_| (0..nc).map(|_| cst[rand(m) as usize]).collect()).collect();
     let mut ptrs = vec![0usize; txs.len()];
-    let mut total: Vec<f64> = Vec::new();
-    for (c, &fc) in carriers_hz.iter().enumerate() {
-        let mut x: Vec<Complex64> = lead.iter().enumerate().map(|(k, v)| v[c] * phasors[c][k].conj() * SCALE).collect();
-        for ((tx, ptr), d0) in txs.iter().zip(ptrs.iter_mut()).zip(&refs) {
-            let mut d = d0[c];
-            x.push(d * phasors[c][0].conj() * SCALE);
-            for s in 1..nsym {
-                if !(s >= 2 && map[c][s - 2]) {
-                    d *= cst[take_bits(tx, ptr, l.bps)];
+    // The symbols, carrier by carrier (they take the bits in this order).
+    let xs: Vec<Vec<Complex64>> = (0..nc)
+        .map(|c| {
+            let mut x: Vec<Complex64> =
+                lead.iter().enumerate().map(|(k, v)| v[c] * phasors[c][k].conj() * SCALE).collect();
+            for ((tx, ptr), d0) in txs.iter().zip(ptrs.iter_mut()).zip(&refs) {
+                let mut d = d0[c];
+                x.push(d * phasors[c][0].conj() * SCALE);
+                for s in 1..nsym {
+                    if !(s >= 2 && map[c][s - 2]) {
+                        d *= cst[take_bits(tx, ptr, l.bps)];
+                    }
+                    x.push(d * phasors[c][s].conj() * SCALE);
                 }
-                x.push(d * phasors[c][s].conj() * SCALE);
             }
+            x.push(Complex64::default());
+            x
+        })
+        .collect();
+    assert!(ptrs.iter().all(|&p| p == l.n() as usize));
+    // X6100: each carrier's audio on its own thread (up to 4 cores); a slow
+    // CPU took ~1 s for L10 and the frame went out after VARA stopped
+    // listening (2026-10-31). Summed in carrier order, so the same samples.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4).min(nc).max(1);
+    let mut sigs: Vec<Vec<f64>> = vec![Vec::new(); nc];
+    std::thread::scope(|sc| {
+        for (t, chunk) in sigs.chunks_mut(nc.div_ceil(threads)).enumerate() {
+            let first = t * nc.div_ceil(threads);
+            let (xs, hp, hi) = (&xs, &hp, &hi);
+            sc.spawn(move || {
+                for (i, out) in chunk.iter_mut().enumerate() {
+                    let c = first + i;
+                    *out = carrier_audio(&xs[c], carriers_hz[c], stagger(c, nc), hp, hi);
+                }
+            });
         }
-        x.push(Complex64::default());
-        let sig = carrier_audio(&x, fc, stagger(c, nc), &hp, &hi);
+    });
+    let mut total: Vec<f64> = Vec::new();
+    for sig in sigs {
         if sig.len() > total.len() {
             total.resize(sig.len(), 0.0);
         }
@@ -158,6 +182,5 @@ pub fn modulate(
             *t += s;
         }
     }
-    assert!(ptrs.iter().all(|&p| p == l.n() as usize));
     total
 }
