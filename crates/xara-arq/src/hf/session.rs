@@ -1181,6 +1181,11 @@ impl Session {
                 for n in self.tx.accept_all() {
                     self.core.host(HostEvent::Buffer(n + self.link.files.len()));
                 }
+                // The peer takes the turn without offering a level, so our next turn
+                // starts where this one ended. Real VARA listens there: resuming at an
+                // older offer (L15 after L16, or after L12) got NACK_MISSED for every
+                // frame down to L1 (PC link with Pat's window raised, 2026-11-01).
+                self.next_tx_level = self.level;
                 self.link.turn_quit(&mut self.tx.buf);
                 if self.wants_qrt() {
                     self.qrt();
