@@ -195,3 +195,92 @@ pub(crate) fn cores() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
+
+// A few threads kept running for work split up inside one audio block. On the
+// X6100 (4x Cortex-A7) starting a thread cost ~0.3 ms, so splitting a block's
+// receive search over fresh threads was slower than not splitting (2026-11-01).
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+struct Pool {
+    tx: std::sync::Mutex<std::sync::mpsc::Sender<Job>>,
+    workers: usize,
+}
+
+thread_local! {
+    static IN_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn pool() -> &'static Pool {
+    static P: OnceLock<Pool> = OnceLock::new();
+    P.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let workers = cores().min(4).saturating_sub(1);
+        for i in 0..workers {
+            let rx = rx.clone();
+            std::thread::Builder::new()
+                .name(format!("xara-dsp{i}"))
+                .spawn(move || {
+                    IN_POOL.with(|f| f.set(true));
+                    loop {
+                        let job = match rx.lock() {
+                            Ok(r) => r.recv(),
+                            Err(_) => return,
+                        };
+                        match job {
+                            Ok(j) => j(),
+                            Err(_) => return,
+                        }
+                    }
+                })
+                .expect("xara-dsp thread");
+        }
+        Pool { tx: std::sync::Mutex::new(tx), workers }
+    })
+}
+
+/// How many ways to split work: the pool's threads and this one.
+pub(crate) fn lanes() -> usize {
+    pool().workers + 1
+}
+
+/// Runs every job and returns when all have finished: the last on this thread,
+/// the others on the pool. From inside a pool job (or with one core) they run
+/// here, one after another, so nested calls cannot wait on each other.
+pub(crate) fn run_all<'a>(mut jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
+    let p = pool();
+    let Some(mine) = jobs.pop() else { return };
+    if jobs.is_empty() || p.workers == 0 || IN_POOL.with(|f| f.get()) {
+        jobs.into_iter().for_each(|j| j());
+        return mine();
+    }
+    let n = jobs.len();
+    let done = Arc::new((std::sync::Mutex::new((0usize, false)), std::sync::Condvar::new()));
+    {
+        let tx = p.tx.lock().unwrap_or_else(|e| e.into_inner());
+        for j in jobs {
+            // SAFETY: this function does not return until every job sent here has
+            // run to the end (the wait below), so what they borrow for 'a outlives them.
+            let j: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(j) };
+            let d = done.clone();
+            let job: Job = Box::new(move || {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(j));
+                let (m, c) = &*d;
+                let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+                g.0 += 1;
+                g.1 |= r.is_err();
+                c.notify_all();
+            });
+            tx.send(job).expect("xara-dsp pool");
+        }
+    }
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(mine));
+    let (m, c) = &*done;
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    while g.0 < n {
+        g = c.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    if g.1 || r.is_err() {
+        panic!("a xara-dsp job panicked");
+    }
+}

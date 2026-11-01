@@ -131,25 +131,36 @@ impl PskEngine {
         }
         let a = self.filter_next - self.delay;
         let seg = buf.get(a, m_hi + self.delay + 1);
-        let order = self.order;
-        for c in &mut self.carriers {
-            let v: Vec<Complex64> = super::rot(a, seg.len(), c.fc).zip(&seg).map(|(r, &s)| r * s).collect();
-            let y: Vec<Complex64> = (0..=(m_hi - self.filter_next) as usize)
-                .map(|i| v[i..i + self.taps.len()].iter().zip(&self.taps).map(|(&x, &t)| x * t).sum())
-                .collect();
-            c.filtered.append(self.filter_next, y);
-            let diff: Vec<Complex64> = (self.filter_next..=m_hi)
-                .map(|n| {
-                    if n - SPS >= c.filtered.base {
-                        unit(*c.filtered.at(n) * c.filtered.at(n - SPS).conj())
-                    } else {
-                        Complex64::default()
-                    }
+        let (order, next, taps, seg) = (self.order, self.filter_next, &self.taps, &seg);
+        let per = self.carriers.len().div_ceil(crate::dsp::lanes());
+        crate::dsp::run_all(
+            self.carriers
+                .chunks_mut(per)
+                .map(|cs| {
+                    Box::new(move || {
+                        for c in cs {
+                            let v: Vec<Complex64> =
+                                super::rot(a, seg.len(), c.fc).zip(seg).map(|(r, &s)| r * s).collect();
+                            let y: Vec<Complex64> = (0..=(m_hi - next) as usize)
+                                .map(|i| v[i..i + taps.len()].iter().zip(taps).map(|(&x, &t)| x * t).sum())
+                                .collect();
+                            c.filtered.append(next, y);
+                            let diff: Vec<Complex64> = (next..=m_hi)
+                                .map(|n| {
+                                    if n - SPS >= c.filtered.base {
+                                        unit(*c.filtered.at(n) * c.filtered.at(n - SPS).conj())
+                                    } else {
+                                        Complex64::default()
+                                    }
+                                })
+                                .collect();
+                            c.diff_pow.append(next, diff.iter().map(|p| p.powi(order)));
+                            c.diff.append(next, diff);
+                        }
+                    }) as Box<dyn FnOnce() + Send + '_>
                 })
-                .collect();
-            c.diff_pow.append(self.filter_next, diff.iter().map(|p| p.powi(order)));
-            c.diff.append(self.filter_next, diff);
-        }
+                .collect(),
+        );
         self.filter_next = m_hi + 1;
     }
 
@@ -214,7 +225,16 @@ impl PskEngine {
             return out;
         }
         let mut chis = vec![0.0; ((hi - lo) / STEP + 1) as usize];
-        self.chis(lo, &mut chis);
+        let per = chis.len().div_ceil(crate::dsp::lanes()).max(8);
+        let me = &*self;
+        crate::dsp::run_all(
+            chis.chunks_mut(per)
+                .enumerate()
+                .map(|(k, out)| {
+                    Box::new(move || me.chis(lo + STEP * (k * per) as i64, out)) as Box<dyn FnOnce() + Send + '_>
+                })
+                .collect(),
+        );
         let mut t = lo;
         for chi in chis {
             if let Some((t, _, ())) = self.hold.offer(t, (chi >= CHI_MIN).then_some((chi, ()))) {
