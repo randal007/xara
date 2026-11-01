@@ -315,7 +315,20 @@ impl Receiver {
             }
         }
         let ctx = Ctx { buf: &self.buf, linked, search_hz: self.search_hz(), ofdm: &self.ofdm_stfts };
-        let mut dets: Vec<Detection> = self.engines.values_mut().flat_map(|e| e.step(&ctx)).collect();
+        // X6100 (4x Cortex-A7): each expected level's search on its own core
+        // (after an ACK xara listens for two or three levels at once).
+        let mut dets: Vec<Detection> = if self.engines.len() > 1 && crate::dsp::cores() > 1 {
+            std::thread::scope(|sc| {
+                let ctx = &ctx;
+                let mut es: Vec<&mut Engine> = self.engines.values_mut().collect();
+                let last = es.pop().unwrap();
+                let hs: Vec<_> = es.into_iter().map(|e| sc.spawn(move || e.step(ctx))).collect();
+                let mine = last.step(ctx);
+                hs.into_iter().flat_map(|h| h.join().unwrap()).chain(mine).collect()
+            })
+        } else {
+            self.engines.values_mut().flat_map(|e| e.step(&ctx)).collect()
+        };
         for (i, st) in self.ofdm_stfts.iter_mut().enumerate() {
             st.keep_from(self.engines.values().filter_map(|e| Some(e.ofdm()?.rows_kept(i))).min());
         }

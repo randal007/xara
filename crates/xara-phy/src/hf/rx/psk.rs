@@ -172,6 +172,36 @@ impl PskEngine {
         (chi, a)
     }
 
+    // chi() at t0, t0 + STEP, ... into out: the same sums in the same order,
+    // but each symbol's term is added for a run of positions at once, so the
+    // memory is read in order. On the X6100 (Cortex-A7) one position at a
+    // time missed the cache on nearly every term: listening for L7 and L10
+    // took 1.6 s of CPU per second of audio, so xara heard VARA later and
+    // later and its ACKs went out too late (2026-11-01); this is 0.7 s.
+    fn chis(&self, t0: i64, out: &mut [f64]) {
+        let n = out.len();
+        let mut a = vec![Complex64::default(); n];
+        let mut b = vec![Complex64::default(); n];
+        for c in &self.carriers {
+            let base = t0 + c.stagger;
+            fn run(track: &Track<Complex64>, t: i64, n: usize) -> impl Iterator<Item = &Complex64> {
+                track.buf[(t - track.base) as usize..].iter().step_by(STEP as usize).take(n)
+            }
+            for (&s, &q) in c.pilots.iter().zip(&c.pilot_ref) {
+                a.iter_mut().zip(run(&c.diff, base + SPS * s as i64, n)).for_each(|(a, &x)| *a += x * q);
+            }
+            for (&s, &q) in c.data.iter().zip(&c.data_ref) {
+                b.iter_mut().zip(run(&c.diff_pow, base + SPS * s as i64, n)).for_each(|(b, &x)| *b += x * q);
+            }
+        }
+        for ((o, a), b) in out.iter_mut().zip(&a).zip(&b) {
+            *o = a.norm_sqr() / self.pilot_count as f64;
+            if self.data_count > 0 {
+                *o += b.norm_sqr() / self.data_count as f64;
+            }
+        }
+    }
+
     pub fn step(&mut self, ctx: &Ctx) -> Vec<Detection> {
         self.filter(ctx.buf);
         let y0 = &self.carriers[0].filtered;
@@ -183,9 +213,10 @@ impl PskEngine {
         if hi < lo {
             return out;
         }
+        let mut chis = vec![0.0; ((hi - lo) / STEP + 1) as usize];
+        self.chis(lo, &mut chis);
         let mut t = lo;
-        while t <= hi {
-            let (chi, _) = self.chi(t);
+        for chi in chis {
             if let Some((t, _, ())) = self.hold.offer(t, (chi >= CHI_MIN).then_some((chi, ()))) {
                 out.push(Detection { record: self.record, t, hint: Hint::Psk });
             }
