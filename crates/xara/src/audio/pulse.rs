@@ -117,6 +117,9 @@ pub struct PulseIo {
     skipped: u64,
     last_latency_log: Instant,
     catching_up: bool,
+    /// Over 60 ms of received audio waiting after a read, until it is down
+    /// to one capture chunk (see read).
+    behind: bool,
     cap_ms: u32,
 }
 
@@ -192,6 +195,7 @@ impl PulseIo {
             skipped: 0,
             last_latency_log: Instant::now(),
             catching_up: false,
+            behind: false,
             cap_ms,
         })
     }
@@ -265,12 +269,21 @@ impl Audio for PulseIo {
             *v = i16::from_le_bytes([c[0], c[1]]);
         }
         self.rx.drain(..need);
+        // X6100 XARA: the station feeds its receivers in bigger pieces while
+        // received audio piles up (cheaper per second, so it catches up). The
+        // same measure as write's silence skip, from a lower mark.
+        let waiting_ms = (self.rec.readable_size() + self.rx.len()) / 2 * 1000 / RATE as usize;
+        if waiting_ms > 60 {
+            self.behind = true;
+        } else if waiting_ms <= self.cap_ms as usize + 10 {
+            self.behind = false;
+        }
         self.report();
         Ok(())
     }
 
-    fn backlog(&mut self) -> usize {
-        (self.rec.readable_size() + self.rx.len()) / 2
+    fn behind(&self) -> bool {
+        self.behind
     }
 
     fn write(&mut self, x: &[i16]) -> io::Result<()> {

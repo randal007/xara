@@ -33,8 +33,6 @@ const SECOND_SIGNAL_GRACE: Duration = Duration::from_secs(2);
 const EXIT_RESTART_FAILED: u8 = 75;
 const TOKEN_ENV: &str = "XARA_UI_TOKEN";
 const RECORD_PART_ENV: &str = "XARA_RECORD_PART";
-/// Most audio blocks taken in one go when capture has piled up (200 ms).
-const CATCH_UP_BLOCKS: usize = 20;
 
 struct Args {
     audio: Backend,
@@ -517,7 +515,8 @@ fn serve<M: Modem>(
         }
         None => None,
     };
-    let pumped = pump(a, io.as_mut(), stop, rec, |x, out, forced| {
+    let pumped = pump(a, io.as_mut(), stop, rec, |x, out, forced, behind| {
+        tnc.set_behind(behind);
         tnc.process(x, out);
         tnc.force_ptt_off(forced);
         Tick { keyed: tnc.keyed(), tuning: tnc.station().tuning(), restart: tnc.restart_requested() }
@@ -530,7 +529,7 @@ fn pump(
     io: &mut dyn Audio,
     stop: &Arc<AtomicBool>,
     mut rec: Option<&mut Recorder>,
-    mut process: impl FnMut(&[f64], &mut [f64], bool) -> Tick,
+    mut process: impl FnMut(&[f64], &mut [f64], bool, bool) -> Tick,
 ) -> Pumped {
     let mut ptt_result = Ok(());
     let mut ptt = match &a.ptt {
@@ -552,22 +551,14 @@ fn pump(
         None => None,
     };
     let mut tx = audio::TxAudio::new(lead_samples(a));
-    let max = audio::BLOCK * CATCH_UP_BLOCKS;
-    let (mut x, mut out) = (vec![0.0; max], vec![0.0; max]);
-    let (mut rx, mut sent) = (vec![0i16; max], vec![0i16; max]);
+    let (mut x, mut out) = (vec![0.0; audio::BLOCK], vec![0.0; audio::BLOCK]);
+    let (mut rx, mut sent) = (vec![0i16; audio::BLOCK], vec![0i16; audio::BLOCK]);
     let audio = (|| {
         while !stop.load(Ordering::SeqCst) {
-            io.read(&mut rx[..audio::BLOCK])?;
-            // Behind (more capture already waiting): take it in one go, up to
-            // 200 ms. The receiver costs much less per second of audio in
-            // bigger pieces (X6100, 4 levels: 0.71 s per s at 20 ms, 0.45 at
-            // 200 ms), so it catches up instead of falling ever further
-            // behind (build 20: 9.5 s, replies talked over VARA's repeats).
-            let n = audio::BLOCK * (1 + (io.backlog() / audio::BLOCK).min(CATCH_UP_BLOCKS - 1));
-            io.read(&mut rx[audio::BLOCK..n])?;
-            let (rx, x, out, sent) = (&rx[..n], &mut x[..n], &mut out[..n], &mut sent[..n]);
-            x.iter_mut().zip(rx).for_each(|(v, &s)| *v = audio::sample(s));
-            let Tick { keyed, tuning, restart } = process(x, out, ptt.as_ref().is_some_and(PttCtl::forced_off));
+            io.read(&mut rx)?;
+            x.iter_mut().zip(&rx).for_each(|(v, &s)| *v = audio::sample(s));
+            let off = ptt.as_ref().is_some_and(PttCtl::forced_off);
+            let Tick { keyed, tuning, restart } = process(&x, &mut out, off, io.behind());
             if keyed {
                 if let Err(e) = ptt.as_mut().map_or(Ok(()), |p| p.set(true)) {
                     ptt_result = Err(e);
@@ -575,11 +566,11 @@ fn pump(
                 }
             }
             let forced = ptt.as_ref().is_some_and(PttCtl::forced_off);
-            tx.process(out, forced);
-            sent.iter_mut().zip(out.iter()).for_each(|(s, &v)| *s = audio::quantize(v));
-            io.write(sent)?;
+            tx.process(&mut out, forced);
+            sent.iter_mut().zip(&out).for_each(|(s, &v)| *s = audio::quantize(v));
+            io.write(&sent)?;
             if let Some(r) = rec.as_deref_mut() {
-                r.push(rx, sent, record::ptt(keyed, forced, tuning));
+                r.push(&rx, &sent, record::ptt(keyed, forced, tuning));
             }
             if !keyed {
                 if let Err(e) = ptt.as_mut().map_or(Ok(()), |p| p.set(false)) {

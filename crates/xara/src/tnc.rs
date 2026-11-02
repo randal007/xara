@@ -74,6 +74,11 @@ impl<M: Modem> Tnc<M> {
         &self.station
     }
 
+    /// The audio loop is behind real time (see Common::behind).
+    pub fn set_behind(&mut self, on: bool) {
+        self.station.set_behind(on);
+    }
+
     pub fn host(&self) -> &Host {
         &self.host
     }

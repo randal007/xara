@@ -96,6 +96,27 @@ fn registered_links_climb_over_audio() {
 }
 
 #[test]
+fn behind_link_over_audio() {
+    // Both ends feeding their receivers 50 ms at a time all session long
+    // (what an X6100 does while catching up): every reply is up to 50 ms late.
+    let mut air = pair(Bandwidth::Hz2750, true, 0.002, Lead::default());
+    for st in &mut air.st {
+        st.set_behind(true);
+    }
+    air.st[0].connect("N0CALL", "N1CALL", &[]);
+    let up = |a: &Air| a.st.iter().all(|s| s.state() != State::Listen && s.state() != State::Calling);
+    assert!(air.run_until(40.0, up), "{}", air.trace());
+    let (pa, pb) = (payload(30000, 77), payload(3000, 78));
+    air.st[0].send(&pa);
+    air.st[1].send(&pb);
+    let secs = 30.0 + (pa.len() + pb.len()) as f64 / 8.0;
+    assert!(air.run_until(secs, |a| a.got[1].len() >= pa.len() && a.got[0].len() >= pb.len()), "{}", air.trace());
+    assert_eq!(air.got[1], pa);
+    assert_eq!(air.got[0], pb);
+    assert!(air.top_tx(0) >= 12, "{}", air.trace());
+}
+
+#[test]
 fn noisy_link_over_audio() {
     for noise in [0.03, 0.08] {
         let air = session(Bandwidth::Hz2300, true, noise, 8000, 500);

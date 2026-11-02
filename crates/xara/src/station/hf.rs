@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use super::scheduler::{Kind, TxFront};
 use super::{Arq, Common, MIN_GAP, Modem, Options, Report, secs};
 use xara_arq::hf::broadcast::{self, Broadcast, Plan};
@@ -21,6 +23,13 @@ use xara_phy::rnd::VbRnd;
 use xara_ui::telemetry::Link;
 
 const FRAGMENT_GAP: usize = 1920;
+/// While the audio is behind, received audio goes to the receivers in pieces
+/// of this size (50 ms) instead of every 10 ms block: the X6100 receiver
+/// costs 0.71 s per s of audio at 20 ms pieces with 4 levels expected, 0.55
+/// at 50 ms (build 20 bench, rxreal), so it catches up instead of falling
+/// ever further behind (9.5 s, replies talked over VARA's repeats). One piece
+/// is then ~27 ms of work there, well inside the 80 ms playback buffer.
+const RX_BATCH: usize = 2400;
 const KISS_SALT: u64 = 0x6B69_7373;
 
 struct Unproto {
@@ -69,6 +78,11 @@ pub struct Station {
     tx_rnd: VbRnd,
     un: Unproto,
     gate_seen: bool,
+    /// Received audio not yet given to the receivers (only while behind).
+    rx_hold: Vec<f64>,
+    /// Receiver events (true: the unproto receiver's), handled in order at
+    /// the point in process() where they always were.
+    rx_events: VecDeque<(bool, Event)>,
 }
 
 impl Station {
@@ -86,6 +100,8 @@ impl Station {
             cb: None,
             tx_rnd: VbRnd::new(),
             gate_seen: crate::signals::may_answer(),
+            rx_hold: Vec::new(),
+            rx_events: VecDeque::new(),
         };
         s.drain();
         s
@@ -117,6 +133,28 @@ impl Station {
         self.drain();
     }
 
+    /// Gives the held audio to the receivers, before anything changes what
+    /// they listen for, so each piece is heard with the settings of its time.
+    /// Their events wait in rx_events.
+    fn feed_held(&mut self) {
+        if self.rx_hold.is_empty() {
+            return;
+        }
+        let x = std::mem::take(&mut self.rx_hold);
+        let evs = self.rx.feed(&x);
+        self.rx_events.extend(evs.into_iter().map(|e| (false, e)));
+        let evs = self.un.rx.feed(&x);
+        self.rx_events.extend(evs.into_iter().map(|e| (true, e)));
+        self.rx_hold = x;
+        self.rx_hold.clear();
+    }
+
+    fn handle_rx_events(&mut self) {
+        while let Some((un, ev)) = self.rx_events.pop_front() {
+            if un { self.on_unproto_event(ev) } else { self.on_event(ev) }
+        }
+    }
+
     fn poll_unproto(&mut self) {
         let listening = self.c.session.state() == State::Listen;
         let mut codes = Vec::new();
@@ -128,6 +166,7 @@ impl Station {
             codes.push(CQ);
         }
         if codes != self.un.codes {
+            self.feed_held();
             let e: Vec<CtrlEntry> = self.un.entries.iter().filter(|e| codes.contains(&e.code)).cloned().collect();
             self.un.rx.set_ctrl_entries((!e.is_empty()).then_some(&e[..]));
             self.un.codes = codes;
@@ -153,6 +192,7 @@ impl Station {
                 broadcast::Event::CancelPending => self.c.reports.push_back(Report::Host(HostEvent::CancelPending)),
                 broadcast::Event::Send(p) => self.send_unproto(now, p),
                 broadcast::Event::Expect(level) => {
+                    self.feed_held();
                     self.un.rx.expect(level.as_slice(), Some(1));
                     if let Some(l) = level {
                         self.c.reports.push_back(unproto_bitrate(l, false));
@@ -329,6 +369,7 @@ impl Station {
 
 impl TxFront for Station {
     fn burst_done(&mut self, kind: Kind, start: Time, end: Time) {
+        self.feed_held();
         let heard = end + self.c.tx.latency();
         self.rx.mute(start - self.rx_base, heard - self.rx_base);
         self.rx.mark_tx_end(heard - self.rx_base);
@@ -376,6 +417,7 @@ impl Modem for Station {
             self.cb = Some(cb);
             self.keys = Some(l.keys.clone());
         }
+        self.feed_held();
         self.gate_seen = crate::signals::may_answer();
         let answering = (self.c.listen_on && self.gate_seen) || self.c.session.state() != State::Listen;
         let entries: Vec<CtrlEntry> =
@@ -446,6 +488,8 @@ impl Modem for Station {
         if !self.idle() {
             return false;
         }
+        self.feed_held();
+        self.handle_rx_events();
         if cfg.bw != self.rx.bw {
             self.rx = Receiver::idle(cfg.bw);
             self.rx_base = self.c.now;
@@ -470,13 +514,17 @@ impl Modem for Station {
         for e in self.c.busy.feed(input, forced) {
             self.c.reports.push_back(Report::Busy(e));
         }
-        for ev in self.rx.feed(&fed) {
-            self.on_event(ev);
+        self.rx_hold.extend_from_slice(&fed);
+        // Never while transmitting or about to: a piece's work in one block
+        // could empty playback mid-frame (a TX gap).
+        let sending = self.c.tx.ptt() || !self.c.tx.is_empty();
+        if !self.c.behind || sending || self.rx_hold.len() >= RX_BATCH {
+            self.feed_held();
         }
-        for ev in self.un.rx.feed(&fed) {
-            self.on_unproto_event(ev);
-        }
+        self.handle_rx_events();
         if self.c.session.next_deadline().is_some_and(|d| d <= self.c.now) {
+            self.feed_held();
+            self.handle_rx_events();
             self.c.session.poll(self.c.now);
         }
         self.drain();

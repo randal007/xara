@@ -90,6 +90,9 @@ pub struct Common<S: Arq> {
     pub(crate) reports: VecDeque<Report>,
     pub(crate) pending: Vec<u8>,
     pub(crate) busy: Busy,
+    /// The audio is behind real time (received audio piling up): the HF
+    /// station then feeds its receivers in bigger pieces to catch up.
+    pub(crate) behind: bool,
 }
 
 impl<S: Arq> Common<S> {
@@ -105,6 +108,7 @@ impl<S: Arq> Common<S> {
             reports: VecDeque::new(),
             pending: Vec::new(),
             busy,
+            behind: false,
         }
     }
 }
@@ -138,6 +142,11 @@ pub trait Modem {
     fn drain(&mut self) {
         let now = self.now();
         self.drain_at(now);
+    }
+
+    /// The audio loop is behind real time (see Common::behind).
+    fn set_behind(&mut self, on: bool) {
+        self.common_mut().behind = on;
     }
 
     fn now(&self) -> Time {
