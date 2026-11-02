@@ -21,6 +21,14 @@ fn main() {
     for n in [1, 4, 5, 7, 9, 10, 11, 12, 14, 17] {
         sets.push((format!("L{n}"), vec![Record::new(n).unwrap()]));
     }
+    // Or the sets in argv, e.g. "10,13" "10,11,12,13".
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        sets = args
+            .iter()
+            .map(|a| (format!("L{a}"), a.split(',').map(|n| Record::new(n.parse().unwrap()).unwrap()).collect()))
+            .collect();
+    }
     for (name, recs) in sets {
         let mut rx = Receiver::new(bw, &recs, 1, Some(&entries));
         rx.linked = true;
