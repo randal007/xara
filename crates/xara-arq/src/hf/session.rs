@@ -437,7 +437,7 @@ impl Session {
     /// one we already answered (false: resend). A repeat can just mean our
     /// resend was lost, but the same "old" poll after REQ_RESENDS resends of a
     /// NACK means our bit is out of step with the remote's: real VARA polled
-    /// one NACK for two minutes, hearing every resend, until it timed out
+    /// one NACK for ~50 s, hearing every resend, until it timed out
     /// (bench 2026-11-02, after ACK_UP3 then a lost L13), so take it as new.
     /// Only after a NACK: after an ACK, "new" would make the remote resend a
     /// frame we already delivered.
