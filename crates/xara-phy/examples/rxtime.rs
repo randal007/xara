@@ -13,7 +13,9 @@ fn main() {
     let secs = 20.0;
     let mut seed = 99u64;
     let mut noise = move || {
-        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
         (seed as f64 / u64::MAX as f64 - 0.5) * 0.02
     };
     let audio: Vec<f64> = (0..(secs * 48000.0) as usize).map(|_| noise()).collect();
