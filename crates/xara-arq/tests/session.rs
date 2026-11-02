@@ -335,6 +335,29 @@ fn receiver_nacks_and_answers_polls() {
 }
 
 #[test]
+fn receiver_takes_a_repeated_poll_as_new() {
+    // Bench 2026-11-02: after a NACK real VARA kept polling with the same code
+    // and xara kept resending the NACK until VARA timed out.
+    let mut sim = Sim::caller();
+    handshake(&mut sim);
+    sim.now += SECOND;
+    let fr = FrameIn { ok: false, bytes: Vec::new(), snr_db: 0.0 };
+    sim.s.on_data(sim.now, DataIn { level: rec(4), frames: vec![fr], t_end: sim.now });
+    assert_eq!(sim.tx(), ctrl(2, 0));
+    assert_eq!(sim.s.level(), rec(3));
+    for _ in 0..3 {
+        sim.ctrl(12, 0);
+        assert_eq!(sim.tx(), ctrl(2, 0));
+        assert_eq!(sim.s.level(), rec(3));
+    }
+    sim.ctrl(12, 0);
+    assert_eq!(sim.tx(), ctrl(19, 0));
+    assert_eq!(sim.s.level(), rec(1));
+    sim.ctrl(12, 0);
+    assert_eq!(sim.tx(), ctrl(19, 0));
+}
+
+#[test]
 fn receiver_answers_unseen_req_with_19_one_format_lower() {
     let mut sim = Sim::caller();
     handshake(&mut sim);

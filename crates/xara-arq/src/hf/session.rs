@@ -26,6 +26,8 @@ const ANSWER_LEVEL_MAX: Record = Record::new(4).unwrap();
 const SNR_REF_INIT_DB: f64 = -100.0;
 const CALL_EXTRA_LEAD: u32 = 9;
 const ANSWER_EXTRA_LEAD: u32 = 7;
+// Resends of one answer to the same repeated poll before taking it as new (req_is_new).
+const REQ_RESENDS: u32 = 3;
 const QRT_CWID_BLANKS: [u32; 3] = [9, 12, 10];
 
 #[derive(Clone, Debug)]
@@ -231,6 +233,8 @@ pub struct Session {
     fmt: Fmt,
     ctrl_snr: ReplyFormat,
     alt: bool,
+    // The poll last answered by resending, and how many times (see req_is_new).
+    req_resent: Option<(u32, u32)>,
     last_code: Option<u32>,
     req_fmt: Option<Fmt>,
     attempts: u32,
@@ -282,6 +286,7 @@ impl Session {
             fmt: Fmt::F0,
             ctrl_snr: ReplyFormat::default(),
             alt: false,
+            req_resent: None,
             stays: Some(0),
             upsteps: 0,
             upstep_from: Record::ONE,
@@ -426,6 +431,32 @@ impl Session {
 
     fn ack_req(&self) -> u32 {
         if self.alt { ACK_REQ_1 } else { ACK_REQ_0 }
+    }
+
+    /// Whether a poll asks about a reply the remote never got (true) or repeats
+    /// one we already answered (false: resend). A repeat can just mean our
+    /// resend was lost, but the same "old" poll after REQ_RESENDS resends of a
+    /// NACK means our bit is out of step with the remote's: real VARA polled
+    /// one NACK for two minutes, hearing every resend, until it timed out
+    /// (bench 2026-11-02, after ACK_UP3 then a lost L13), so take it as new.
+    /// Only after a NACK: after an ACK, "new" would make the remote resend a
+    /// frame we already delivered.
+    fn req_is_new(&mut self, code: u32) -> bool {
+        if code == self.ack_req() {
+            self.req_resent = None;
+            return true;
+        }
+        let n = match self.req_resent {
+            Some((c, n)) if c == code => n,
+            _ => 0,
+        };
+        if n >= REQ_RESENDS && matches!(self.last_code, Some(NACK | NACK_MISSED)) {
+            self.alt = !self.alt;
+            self.req_resent = None;
+            return true;
+        }
+        self.req_resent = Some((code, n + 1));
+        false
     }
 
     fn request_codes(&self) -> Vec<u32> {
@@ -874,7 +905,7 @@ impl Session {
 
     fn ctrl_answering(&mut self, now: Time, c: CtrlIn) {
         match c.code {
-            ACK_REQ_0 | ACK_REQ_1 if c.code == self.ack_req() => {
+            ACK_REQ_0 | ACK_REQ_1 if self.req_is_new(c.code) => {
                 self.alt = !self.alt;
                 let new = step_down(self.bw, self.level);
                 self.header_nack(new);
@@ -894,6 +925,7 @@ impl Session {
     }
 
     fn on_header(&mut self, now: Time, d: DataIn) {
+        self.req_resent = None;
         let f = &d.frames[0];
         let Some(h) = Header::parse(&f.bytes).filter(|_| f.ok) else {
             self.alt = !self.alt;
@@ -1221,7 +1253,7 @@ impl Session {
 
     fn ctrl_receiving(&mut self, c: CtrlIn) {
         match c.code {
-            ACK_REQ_0 | ACK_REQ_1 if c.code == self.ack_req() => {
+            ACK_REQ_0 | ACK_REQ_1 if self.req_is_new(c.code) => {
                 for _ in 0..self.nframes() {
                     self.adapt.frame_lost(self.level);
                 }
@@ -1267,6 +1299,7 @@ impl Session {
         if self.state != State::Receiving || d.t_end < self.core.tx_end {
             return;
         }
+        self.req_resent = None;
         self.feed_watchdog(now);
         if self.link.disc_now {
             self.qrt();
