@@ -1119,6 +1119,13 @@ impl Session {
             } else {
                 queue_hint(bw, level, after.len())
             };
+            // Real VARA 4.9.0 never says "the rest fits a lower level" (hint 0) on a
+            // frame that is not the last of its turn: its full L15-L17 frames with
+            // 145-1503 bytes left carried 6 (PC link 2026-11-01), while it keeps the
+            // table otherwise (hint 2 in tests/session.rs). xara's 0 there made VARA
+            // step it down: Pat keeps only ~8 KB in flight, so after a full L16
+            // frame the rest "fit" in L15 (ACK_DOWN), and back up again.
+            let hint = if hint == 0 && !last { HINT_MAX } else { hint };
             let hint = match std::mem::take(&mut self.hint_override) {
                 HintOverride::Max => HINT_MAX,
                 HintOverride::TableMinimum => hint.max(hint_table_minimum(bw, level, text)),
