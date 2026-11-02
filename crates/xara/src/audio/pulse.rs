@@ -269,6 +269,10 @@ impl Audio for PulseIo {
         Ok(())
     }
 
+    fn backlog(&mut self) -> usize {
+        (self.rec.readable_size() + self.rx.len()) / 2
+    }
+
     fn write(&mut self, x: &[i16]) -> io::Result<()> {
         let Some(play) = &mut self.play else { return Err(capture_only()) };
         self.tx.clear();

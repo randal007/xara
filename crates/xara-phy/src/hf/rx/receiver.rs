@@ -114,6 +114,14 @@ impl CtrlEvent {
 
 pub type Event = crate::receiver::Event<CtrlEvent, FrameRx>;
 
+/// Threads for the level searches: XARA_RX_THREADS, else one per core.
+fn rx_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("XARA_RX_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(crate::dsp::cores).max(1)
+    })
+}
+
 pub fn to48(m: i64) -> i64 {
     m * DEC
 }
@@ -154,6 +162,12 @@ impl Engine {
 
     fn is_psk(&self) -> bool {
         matches!(self, Engine::Psk(_))
+    }
+
+    /// Rough relative search cost on the radio (rxreal, 2750: L10 PSK ~0.33 s
+    /// per s of audio, an OFDM level ~0.17).
+    fn cost(&self) -> u32 {
+        if self.is_psk() { 2 } else { 1 }
     }
 
     fn step(&mut self, ctx: &Ctx) -> Vec<Detection> {
@@ -315,15 +329,26 @@ impl Receiver {
             }
         }
         let ctx = Ctx { buf: &self.buf, linked, search_hz: self.search_hz(), ofdm: &self.ofdm_stfts };
-        // X6100 (4x Cortex-A7): each expected level's search on its own core
-        // (after an ACK xara listens for two or three levels at once).
-        let mut dets: Vec<Detection> = if self.engines.len() > 1 && crate::dsp::cores() > 1 {
+        // X6100 (4x Cortex-A7): the expected levels' searches spread over up to
+        // rx_threads() threads, heaviest first onto the least loaded (after an
+        // ACK xara listens for two to four levels at once).
+        let nt = rx_threads().min(self.engines.len());
+        let mut dets: Vec<Detection> = if nt > 1 {
+            let mut es: Vec<&mut Engine> = self.engines.values_mut().collect();
+            es.sort_by_key(|e| std::cmp::Reverse(e.cost()));
+            let mut groups: Vec<(u32, Vec<&mut Engine>)> = (0..nt).map(|_| (0, Vec::new())).collect();
+            for e in es {
+                let g = groups.iter_mut().min_by_key(|g| g.0).unwrap();
+                g.0 += e.cost();
+                g.1.push(e);
+            }
             std::thread::scope(|sc| {
                 let ctx = &ctx;
-                let mut es: Vec<&mut Engine> = self.engines.values_mut().collect();
-                let last = es.pop().unwrap();
-                let hs: Vec<_> = es.into_iter().map(|e| sc.spawn(move || e.step(ctx))).collect();
-                let mine = last.step(ctx);
+                let mut gs = groups.into_iter().map(|g| g.1);
+                let mine = gs.next().unwrap();
+                let hs: Vec<_> =
+                    gs.map(|g| sc.spawn(move || g.into_iter().flat_map(|e| e.step(ctx)).collect::<Vec<_>>())).collect();
+                let mine: Vec<Detection> = mine.into_iter().flat_map(|e| e.step(ctx)).collect();
                 hs.into_iter().flat_map(|h| h.join().unwrap()).chain(mine).collect()
             })
         } else {
@@ -332,7 +357,7 @@ impl Receiver {
         for (i, st) in self.ofdm_stfts.iter_mut().enumerate() {
             st.keep_from(self.engines.values().filter_map(|e| Some(e.ofdm()?.rows_kept(i))).min());
         }
-        dets.sort_by_key(|d| d.t);
+        dets.sort_by_key(|d| (d.t, d.record));
         for d in dets {
             ev.extend(self.on_det(d.record, d.t, d.hint));
         }

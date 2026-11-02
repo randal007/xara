@@ -32,6 +32,10 @@ fn remaining(until: Instant, what: &str) -> io::Result<Duration> {
 pub trait Audio {
     fn read(&mut self, x: &mut [i16]) -> io::Result<()>;
     fn write(&mut self, x: &[i16]) -> io::Result<()>;
+    /// Capture samples already waiting: reading that many won't block.
+    fn backlog(&mut self) -> usize {
+        0
+    }
 }
 
 pub fn sample(v: i16) -> f64 {
