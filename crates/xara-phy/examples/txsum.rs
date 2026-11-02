@@ -1,5 +1,5 @@
 // A checksum of each level's frame audio (2750, fixed input), to check a change keeps the samples.
-use xara_phy::hf::level::{Bandwidth, Record};
+use xara_phy::hf::level::Bandwidth;
 use xara_phy::hf::tx::Modulator;
 
 fn main() {
