@@ -94,6 +94,11 @@ impl KissServer {
         thread::Builder::new().name("kiss-accept".into()).spawn(move || {
             for id in 0u64..=u64::MAX {
                 let s = match l.accept() {
+                    Ok((s, peer)) if !crate::server::peer_allowed(&peer) => {
+                        eprintln!("xara: kiss refused {peer}: not a local address (--local-only)");
+                        drop(s);
+                        continue;
+                    }
                     Ok((s, _)) => s,
                     Err(_) => {
                         thread::sleep(crate::server::ACCEPT_BACKOFF);

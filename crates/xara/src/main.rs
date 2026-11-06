@@ -132,6 +132,7 @@ fn take(a: &mut Args, k: &str, mut v: impl FnMut() -> Result<String, String>) ->
         "--addr" => a.addr = v()?,
         "--drive-db" => a.drive_db = finite(k, &v()?)?,
         "--quiet" => a.quiet = true,
+        "--local-only" => xara_host::server::LOCAL_ONLY.store(true, std::sync::atomic::Ordering::Relaxed),
         "--ui-control" => a.ui_control = true,
         "--ui-token" => {
             let t = v()?;

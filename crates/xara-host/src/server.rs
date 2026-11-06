@@ -13,6 +13,29 @@ pub const DATA_CHUNK: usize = 65536;
 pub const INPUT_QUEUE: usize = 64;
 pub(crate) const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// `--local-only`: the host and KISS ports take connections from local
+/// addresses only (private IPv4 ranges, link-local, loopback; IPv6 unique
+/// local and link-local). The VARA host protocol has no password, so a
+/// client from anywhere else could make the radio connect and transmit.
+pub static LOCAL_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// May this peer connect (see [`LOCAL_ONLY`])?
+pub fn peer_allowed(peer: &SocketAddr) -> bool {
+    if !LOCAL_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    match peer.ip() {
+        std::net::IpAddr::V4(a) => a.is_private() || a.is_loopback() || a.is_link_local(),
+        std::net::IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return v4.is_private() || v4.is_loopback() || v4.is_link_local();
+            }
+            let s0 = a.segments()[0];
+            a.is_loopback() || (s0 & 0xfe00) == 0xfc00 || (s0 & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Input {
     Command(Command),
@@ -175,6 +198,11 @@ fn serve(l: TcpListener, port: Port, clients: Shared, tx: SyncSender<Input>, hol
     thread::Builder::new().name(name.into()).spawn(move || {
         loop {
             let s = match l.accept() {
+                Ok((s, peer)) if !peer_allowed(&peer) => {
+                    eprintln!("xara: {name} refused {peer}: not a local address (--local-only)");
+                    drop(s);
+                    continue;
+                }
                 Ok((s, _)) => s,
                 Err(_) => {
                     thread::sleep(ACCEPT_BACKOFF);
@@ -256,5 +284,29 @@ fn read_data(mut s: TcpStream, tx: &SyncSender<Input>, hold: &Hold) {
         if tx.send(Input::Data(buf[..n].to_vec())).is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod local_only_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn local_only_takes_local_peers_and_refuses_the_rest() {
+        let ok = ["192.168.1.20:5000", "10.0.0.7:1", "172.16.5.5:1", "127.0.0.1:1", "169.254.3.3:1", "[fe80::1]:1", "[fd00::5]:1", "[::1]:1", "[::ffff:192.168.0.2]:1"];
+        let no = ["8.8.8.8:1", "100.64.0.1:1", "172.32.0.1:1", "[2001:db8::1]:1", "[::ffff:1.2.3.4]:1"];
+        LOCAL_ONLY.store(false, Ordering::Relaxed);
+        for a in ok.iter().chain(no.iter()) {
+            assert!(peer_allowed(&a.parse().unwrap()), "{a} off: all allowed");
+        }
+        LOCAL_ONLY.store(true, Ordering::Relaxed);
+        for a in ok {
+            assert!(peer_allowed(&a.parse().unwrap()), "{a} should be allowed");
+        }
+        for a in no {
+            assert!(!peer_allowed(&a.parse().unwrap()), "{a} should be refused");
+        }
+        LOCAL_ONLY.store(false, Ordering::Relaxed);
     }
 }
